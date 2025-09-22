@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic>=2
+langchain>=0.2.12
+langchain-openai
+langchain-community
+chromadb
+sentence-transformers
+duckduckgo-search
+tiktoken
+typing_extensions
+# DSPy (옵션)
+dspy-ai
+docarray
