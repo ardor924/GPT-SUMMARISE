@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from .intent_gate import semantic_gate
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
@@ -8,9 +9,7 @@ from dotenv import load_dotenv
 import os, glob
 from datetime import datetime
 
-# =========================
 # bootstrap
-# =========================
 try:
     from .bootstrap import ensure_requirements_installed
 except Exception:
@@ -21,9 +20,7 @@ except Exception:
                                           lock_path: str = ".requirements.sha256"):
             return False, "bootstrap module missing"
 
-# =========================
 # 내부 모듈
-# =========================
 try:
     from .pipeline_langchain import FarmLogPipeline, FarmLog
 except Exception as e:
@@ -34,15 +31,12 @@ try:
 except Exception as e:
     raise RuntimeError(f"cannot import rag: {e}")
 
-# 통합 분석기
 try:
     from .extract import analyse
 except Exception as e:
     raise RuntimeError(f"cannot import extract.analyse: {e}")
 
-# =========================
 # 경로/상수
-# =========================
 PROJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 REQ_PATH   = os.getenv("REQUIREMENTS_PATH", os.path.join(PROJ_ROOT, "requirements.txt"))
@@ -57,7 +51,6 @@ REJECT_MSG = (
     "영농일지/농업 관련 내용을 말해주세요."
 )
 
-# 게이트 폴백용 기본 키워드
 _DEFAULT_FARM_KEYWORDS: Set[str] = {
     "영농","농업","농사","작목","작물","재배","포장","하우스","과원","논","밭",
     "관수","灌水","시비","비료","엽면시비","방제","제초","파종","정식","수확","적과","전정","멀칭",
@@ -65,21 +58,14 @@ _DEFAULT_FARM_KEYWORDS: Set[str] = {
     "배추","고추","사과","토마토","감자","상추","딸기","파프리카","오이","참외","포도","복숭아",
 }
 
-# =========================
-# FastAPI
-# =========================
 app = FastAPI(title="FarmLog STT→RAG Baseline")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# =========================
-# Pydantic models
-# =========================
+# 모델들
 class SummariseRequest(BaseModel):
     stt_text: str
     date_hint: Optional[str] = None
@@ -100,7 +86,7 @@ class SummariseFileRequest(BaseModel):
 class TextInfo(BaseModel):
     name: str
     size: int
-    mtime: str  # ISO8601
+    mtime: str
 
 class SummarisePathJSON(BaseModel):
     path: str
@@ -110,18 +96,13 @@ class SummarisePathJSON(BaseModel):
     search_queries: Optional[List[str]] = None
 
 class SummariseAutoRequest(BaseModel):
-    path: Optional[str] = None         # text/xxx.txt
-    stt_text: Optional[str] = None     # 파일 대신 직접 텍스트
-    date_hint: Optional[str] = None    # 있으면 analyse 결과보다 우선 적용
+    path: Optional[str] = None
+    stt_text: Optional[str] = None
+    date_hint: Optional[str] = None
 
-# =========================
-# 전역 상태
-# =========================
 _pipeline: Optional[FarmLogPipeline] = None
 
-# =========================
-# 유틸: text/ 파일
-# =========================
+# 유틸
 def _list_text_files() -> List[TextInfo]:
     os.makedirs(TEXT_DIR, exist_ok=True)
     files = sorted(glob.glob(os.path.join(TEXT_DIR, "*.txt")))
@@ -150,9 +131,6 @@ def _normalise_to_basename(path: str) -> str:
         raise HTTPException(status_code=400, detail="invalid path")
     return base
 
-# =========================
-# 키워드 로딩 (farming_keywords.txt)
-# =========================
 def _load_farm_keywords(path: str) -> Set[str]:
     kws: Set[str] = set()
     try:
@@ -179,38 +157,29 @@ def _load_farm_keywords(path: str) -> Set[str]:
         return set()
     return kws
 
-# =========================
 # 스타트업
-# =========================
 @app.on_event("startup")
 def _startup():
     load_dotenv()
-
     installed, msg = ensure_requirements_installed(requirements_path=REQ_PATH, lock_path=REQ_LOCK)
     app.state.requirements_status = {"installed_or_ok": installed, "message": msg}
 
     try:
         vs, backend = build_or_load_vectorstore(
-            kb_dir=KB_DIR,
-            persist_dir=CHROMA_DIR,
+            kb_dir=KB_DIR, persist_dir=CHROMA_DIR,
             force_vectorstore=os.getenv("FORCE_VECTORSTORE"),
         )
         app.state.vector_backend = backend
     except Exception as e:
         app.state.vector_backend = f"indexing-error: {e}"
 
-    # 키워드 캐시 (빈 결과/실패 시 기본 키워드 폴백)
     try:
-        kws = _load_farm_keywords(KEYWORDS_PATH)
-        if not kws:
-            kws = set(_DEFAULT_FARM_KEYWORDS)
+        kws = _load_farm_keywords(KEYWORDS_PATH) or set(_DEFAULT_FARM_KEYWORDS)
         app.state.farm_keywords = kws
     except Exception:
         app.state.farm_keywords = set(_DEFAULT_FARM_KEYWORDS)
 
-# =========================
-# 헬스/리스트
-# =========================
+# 헬스
 @app.get("/healthz")
 def healthz():
     return {
@@ -219,16 +188,17 @@ def healthz():
         "vector_backend": getattr(app.state, "vector_backend", None),
         "keywords_count": len(getattr(app.state, "farm_keywords", set())),
         "keywords_path": KEYWORDS_PATH,
-        "gate_min_hits": int(os.getenv("FARM_GATE_MIN_HITS", "2")),
+        "gate_min_hits": int(os.getenv("FARM_GATE_MIN_HITS", "1")),
+        "gate_min_op_hits": int(os.getenv("FARM_GATE_MIN_OP_HITS", "1")),
+        "gate_block_nonfarm": os.getenv("FARM_GATE_BLOCK_NONFARM", "true").lower() in ("1","true","yes"),
+        "nonfarm_block_min_hits": int(os.getenv("NONFARM_BLOCK_MIN_HITS", "2")),
     }
 
 @app.get("/texts")
 def list_texts():
     return _list_text_files()
 
-# =========================
-# 공통 실행 헬퍼 (게이트 강화)
-# =========================
+# 공통 실행(게이트)
 def _run_with_analysis(
     stt_text: str,
     date_hint: Optional[str] = None,
@@ -236,41 +206,71 @@ def _run_with_analysis(
     location_hint: Optional[str] = None,
     search_queries: Optional[List[str]] = None,
 ):
-    # 1) 통합 분석 (게이트 + 힌트 추출)
-    domain_kws: Set[str] = getattr(app.state, "farm_keywords", set())
-    if not domain_kws:
-        domain_kws = set(_DEFAULT_FARM_KEYWORDS)
-        app.state.farm_keywords = domain_kws
+    # [A] 의미 게이트(임베딩) — 실패해도 규칙게이트로 폴백
+    try:
+        is_semantic_ok, pos_sim, neg_sim = semantic_gate(stt_text, kb_dir=KB_DIR)
+    except Exception:
+        is_semantic_ok, pos_sim, neg_sim = False, 0.0, 0.0
 
+    # [B] 규칙 기반 분석
+    domain_kws: Set[str] = getattr(app.state, "farm_keywords", set()) or set(_DEFAULT_FARM_KEYWORDS)
+    app.state.farm_keywords = domain_kws
     res = analyse(stt_text, domain_kws, default_date=date_hint)
 
-    # 🔒 게이트 강화: MIN_HITS(기본 2) 규칙 + crop/location 대안
+    # 파라미터
     try:
-        min_hits = int(os.getenv("FARM_GATE_MIN_HITS", "2"))
+        min_hits = int(os.getenv("FARM_GATE_MIN_HITS", "1"))      # 완화
     except Exception:
-        min_hits = 2
+        min_hits = 1
+    try:
+        min_op_hits = int(os.getenv("FARM_GATE_MIN_OP_HITS", "1"))
+    except Exception:
+        min_op_hits = 1
+    block_nonfarm = os.getenv("FARM_GATE_BLOCK_NONFARM", "true").lower() in ("1","true","yes")
+    try:
+        nonfarm_block_min = int(os.getenv("NONFARM_BLOCK_MIN_HITS", "2"))   # ❗ 2회 이상일 때만 차단
+    except Exception:
+        nonfarm_block_min = 2
 
-    domain_hits = int(res.get("domain_hits") or 0)
+    domain_hits  = int(res.get("domain_hits") or 0)
+    op_hits      = int(res.get("op_hits") or 0)
+    nonfarm_hits = int(res.get("non_farm_hits") or 0)
+    agri_hits    = int(res.get("agri_hits") or 0)
+
     crop_auto = res.get("crop_hint")
     loc_auto  = res.get("location_hint")
-
-    # 사용자가 명시한 힌트가 있으면 그것도 판단에 활용
     crop_eff = crop_hint or crop_auto
     loc_eff  = location_hint or loc_auto
 
-    # 최종 게이트: 충분히 관련(키워드 매칭)하거나, 도메인스러운 구조 신호(작물/위치) 존재
-    is_related_final = (domain_hits >= min_hits) or bool(crop_eff or loc_eff)
+    # [C] 최종 게이트 결합 (재현율↑, 오탐↓)
+    # 1) 의미 게이트 통과 & (비농업 ≥ 기준) 아님  -> 통과
+    # 2) 의미 실패시:
+    #    a) 화이트리스트(agri_hits>=1)면 통과
+    #    b) (domain_hits>=min_hits) or (crop/loc and (op_hits>=min_op_hits or domain_hits>=1))
+    # 3) 차단은 (block_nonfarm==True) AND (nonfarm_hits>=nonfarm_block_min) AND (agri_hits==0) 일 때만
+    rule_ok = (
+        (agri_hits >= 1) or
+        (domain_hits >= min_hits) or
+        (bool(crop_eff or loc_eff) and ((op_hits >= min_op_hits) or (domain_hits >= 1)))
+    )
+    is_related_final = False
+    if is_semantic_ok and not (block_nonfarm and (nonfarm_hits >= nonfarm_block_min) and agri_hits == 0):
+        is_related_final = True
+    else:
+        if block_nonfarm and (nonfarm_hits >= nonfarm_block_min) and agri_hits == 0:
+            is_related_final = False
+        else:
+            is_related_final = rule_ok
 
     if not is_related_final:
         return PlainTextResponse(REJECT_MSG)
 
-    # 3) 힌트 병합(사용자 입력 우선 → 없으면 analyse 결과)
+    # [D] 힌트 병합 & 실행
     merged_date = date_hint or res.get("date_hint")
     merged_crop = crop_hint or crop_auto
     merged_loc  = location_hint or loc_auto
     merged_qs   = search_queries or res.get("search_queries") or []
 
-    # 4) 파이프라인 실행
     global _pipeline
     if _pipeline is None:
         _pipeline = FarmLogPipeline()
@@ -283,9 +283,7 @@ def _run_with_analysis(
         search_queries=merged_qs,
     )
 
-# =========================
-# Summarise: 자유 텍스트
-# =========================
+# 엔드포인트들
 @app.post("/summarise")
 def summarise(req: SummariseRequest):
     return _run_with_analysis(
@@ -296,9 +294,6 @@ def summarise(req: SummariseRequest):
         search_queries=req.search_queries,
     )
 
-# =========================
-# Summarise: 파일 선택
-# =========================
 @app.post("/summarise_file")
 def summarise_file(req: SummariseFileRequest):
     filename = req.filename
@@ -316,18 +311,12 @@ def summarise_file(req: SummariseFileRequest):
         search_queries=req.search_queries,
     )
 
-# =========================
-# Summarise: 경로만 (text/plain)
-# =========================
 @app.post("/summarise_path")
 def summarise_path(path: str = Body(..., media_type="text/plain")):
     filename = _normalise_to_basename(path)
     stt_text = _read_text_file_safe(filename)
     return _run_with_analysis(stt_text=stt_text)
 
-# =========================
-# Summarise: 경로 JSON
-# =========================
 @app.post("/summarise_path_json")
 def summarise_path_json(req: SummarisePathJSON):
     filename = _normalise_to_basename(req.path)
@@ -340,9 +329,6 @@ def summarise_path_json(req: SummarisePathJSON):
         search_queries=req.search_queries,
     )
 
-# =========================
-# Summarise: 자동(경로 or 텍스트)
-# =========================
 @app.post("/summarise_auto")
 def summarise_auto(req: SummariseAutoRequest):
     if not req.path and not req.stt_text:
@@ -352,7 +338,6 @@ def summarise_auto(req: SummariseAutoRequest):
         stt_text = _read_text_file_safe(filename)
     else:
         stt_text = (req.stt_text or "").strip()
-    # date_hint만 사용자 override 허용(나머지는 analyse 결과 사용)
     return _run_with_analysis(
         stt_text=stt_text,
         date_hint=req.date_hint,
@@ -361,9 +346,6 @@ def summarise_auto(req: SummariseAutoRequest):
         search_queries=None,
     )
 
-# =========================
-# KB 재인덱싱(+키워드 재로딩)
-# =========================
 @app.post("/ingest")
 def ingest(req: IngestRequest):
     kb_dir = req.kb_dir or KB_DIR
@@ -375,15 +357,11 @@ def ingest(req: IngestRequest):
         global _pipeline
         _pipeline = None
         app.state.vector_backend = backend
-        # 키워드 재로딩 (빈 결과면 기본 키워드 폴백)
         try:
-            kws = _load_farm_keywords(KEYWORDS_PATH)
-            if not kws:
-                kws = set(_DEFAULT_FARM_KEYWORDS)
+            kws = _load_farm_keywords(KEYWORDS_PATH) or set(_DEFAULT_FARM_KEYWORDS)
             app.state.farm_keywords = kws
         except Exception:
             app.state.farm_keywords = set(_DEFAULT_FARM_KEYWORDS)
-
         return {
             "status": "ok",
             "kb_dir": kb_dir,
