@@ -109,6 +109,7 @@ def analyse(
         if "오늘" in text:
             dt = datetime.now().strftime("%Y-%m-%d")
         elif "어제" in text:
+            # 간단 처리(정밀한 상대일자 파싱이 필요하면 여기 확장)
             dt = datetime.now().strftime("%Y-%m-%d")
 
     # 5) 검색쿼리 (작물이 확정된 경우에만 생성)

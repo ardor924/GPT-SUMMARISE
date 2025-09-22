@@ -57,7 +57,7 @@ REJECT_MSG = (
     "영농일지/농업 관련 내용을 말해주세요."
 )
 
-# 게이트 폴백용 기본 키워드
+# 게이트가 비어 있거나 너무 느슨할 때를 대비한 기본 키워드(폴백)
 _DEFAULT_FARM_KEYWORDS: Set[str] = {
     "영농","농업","농사","작목","작물","재배","포장","하우스","과원","논","밭",
     "관수","灌水","시비","비료","엽면시비","방제","제초","파종","정식","수확","적과","전정","멀칭",
@@ -222,7 +222,7 @@ def healthz():
         "gate_min_hits": int(os.getenv("FARM_GATE_MIN_HITS", "2")),
     }
 
-@app.get("/texts")
+@app.get("/texts", response_model=List[TextInfo])
 def list_texts():
     return _list_text_files()
 
@@ -235,10 +235,11 @@ def _run_with_analysis(
     crop_hint: Optional[str] = None,
     location_hint: Optional[str] = None,
     search_queries: Optional[List[str]] = None,
-):
+) -> FarmLog:
     # 1) 통합 분석 (게이트 + 힌트 추출)
     domain_kws: Set[str] = getattr(app.state, "farm_keywords", set())
     if not domain_kws:
+        # 혹시 모를 예외 상황(키워드 미로드) 폴백
         domain_kws = set(_DEFAULT_FARM_KEYWORDS)
         app.state.farm_keywords = domain_kws
 
@@ -286,7 +287,7 @@ def _run_with_analysis(
 # =========================
 # Summarise: 자유 텍스트
 # =========================
-@app.post("/summarise")
+@app.post("/summarise", response_model=FarmLog)
 def summarise(req: SummariseRequest):
     return _run_with_analysis(
         stt_text=req.stt_text,
@@ -299,7 +300,7 @@ def summarise(req: SummariseRequest):
 # =========================
 # Summarise: 파일 선택
 # =========================
-@app.post("/summarise_file")
+@app.post("/summarise_file", response_model=FarmLog)
 def summarise_file(req: SummariseFileRequest):
     filename = req.filename
     if not filename:
@@ -319,7 +320,7 @@ def summarise_file(req: SummariseFileRequest):
 # =========================
 # Summarise: 경로만 (text/plain)
 # =========================
-@app.post("/summarise_path")
+@app.post("/summarise_path", response_model=FarmLog)
 def summarise_path(path: str = Body(..., media_type="text/plain")):
     filename = _normalise_to_basename(path)
     stt_text = _read_text_file_safe(filename)
@@ -328,7 +329,7 @@ def summarise_path(path: str = Body(..., media_type="text/plain")):
 # =========================
 # Summarise: 경로 JSON
 # =========================
-@app.post("/summarise_path_json")
+@app.post("/summarise_path_json", response_model=FarmLog)
 def summarise_path_json(req: SummarisePathJSON):
     filename = _normalise_to_basename(req.path)
     stt_text = _read_text_file_safe(filename)
@@ -343,7 +344,7 @@ def summarise_path_json(req: SummarisePathJSON):
 # =========================
 # Summarise: 자동(경로 or 텍스트)
 # =========================
-@app.post("/summarise_auto")
+@app.post("/summarise_auto", response_model=FarmLog)
 def summarise_auto(req: SummariseAutoRequest):
     if not req.path and not req.stt_text:
         raise HTTPException(status_code=400, detail="either path or stt_text is required")
