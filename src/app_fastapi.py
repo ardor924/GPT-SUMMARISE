@@ -1,5 +1,6 @@
 # src/app_fastapi.py
 # -*- coding: utf-8 -*-
+from .semantic_normalize import normalize_csv_semantic  
 from .intent_gate import semantic_gate
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,6 +64,7 @@ KB_DIR     = os.getenv("KB_DIR", os.path.join(PROJ_ROOT, "kb"))
 CHROMA_DIR = os.getenv("CHROMA_DIR", os.path.join(PROJ_ROOT, "chroma"))
 KEYWORDS_PATH = os.getenv("KEYWORDS_PATH", os.path.join(KB_DIR, "farming_keywords.txt"))
 
+
 _raw_csv_dir = os.getenv("STT_CSV_DIR", os.path.join(PROJ_ROOT, "stt_csv"))
 STT_CSV_DIR = os.path.abspath(_raw_csv_dir if os.path.isabs(_raw_csv_dir) else os.path.join(PROJ_ROOT, _raw_csv_dir))
 STT_CSV_FILENAME = os.getenv("STT_CSV_FILENAME", "qa.csv")
@@ -81,6 +83,7 @@ _DEFAULT_FARM_KEYWORDS: Set[str] = {
 }
 
 CSV_GATE_LENIENT = os.getenv("CSV_GATE_LENIENT", "1").lower() in ("1","true","yes")
+USE_SEMANTIC_NORMALIZER = os.getenv("USE_SEMANTIC_NORMALIZER", "1").lower() in ("1","true","yes")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI
@@ -417,14 +420,31 @@ def _normalize_qa(qa: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
     }
 
 def _qa_to_summary(qa: Dict[str, Optional[str]]) -> CsvSummary:
-    n = _normalize_qa(qa)
+    # 1) 의미 기반 정규화(LLM) 우선
+    if USE_SEMANTIC_NORMALIZER:
+        try:
+            norm = normalize_csv_semantic(qa)  # site/crop/operation/pesticide/fertiliser/memo
+            return CsvSummary(
+                site=norm.get("site"),
+                crop=norm.get("crop"),
+                operation=norm.get("operation"),
+                pesticide=norm.get("pesticide"),
+                fertiliser=norm.get("fertiliser"),
+                memo=norm.get("memo"),
+            )
+        except Exception:
+            # LLM 실패 시 폴백
+            pass
+
+    # 2) 폴백: 기존 규칙 정규화
+    norm2 = _normalize_qa(qa)
     return CsvSummary(
-        site=n.get("site"),
-        crop=n.get("crop"),
-        operation=n.get("operation"),
-        pesticide=n.get("pesticide"),
-        fertiliser=n.get("fertiliser"),
-        memo=n.get("memo"),
+        site=norm2.get("site"),
+        crop=norm2.get("crop"),
+        operation=norm2.get("operation"),
+        pesticide=norm2.get("pesticide"),
+        fertiliser=norm2.get("fertiliser"),
+        memo=norm2.get("memo"),
     )
 
 @app.post("/summarise_csv_id", response_model=CsvSummary, response_model_by_alias=True)

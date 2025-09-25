@@ -150,6 +150,7 @@ def normalize_agri_input(s: Optional[str]) -> Optional[str]:
     s = collapse_commas_spaces(drop_front_interjection(s))
     s = strip_tail_speech(s)
     # 맥락어 제거
+    s = re.sub(r"\b보자(\.\.)?\b", "", s).strip()
     s = re.sub(r"\b(이번엔|이번에는|오늘은|지금은|금번엔|이번|금번)\b", "", s).strip()
     # 부정/미사용 패턴
     if NONEISH_RE.search(s):
