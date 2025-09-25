@@ -1,28 +1,17 @@
-# src/app_fastapi.py
 # -*- coding: utf-8 -*-
 from .intent_gate import semantic_gate
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field
 from typing import List, Optional, Set, Dict
 from dotenv import load_dotenv
-import os, glob
+import os, glob, csv
 from datetime import datetime
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 새로 분리된 모듈들
-# ──────────────────────────────────────────────────────────────────────────────
-from .csv_io import read_qa_csv
-from .gates import gate_csv_qa
-from .preprocess import (
-    normalize_site, normalize_crop, normalize_operation,
-    normalize_agri_input, summarize_memo,
-)
-
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 # bootstrap
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 try:
     from .bootstrap import ensure_requirements_installed
 except Exception:
@@ -33,9 +22,9 @@ except Exception:
                                           lock_path: str = ".requirements.sha256"):
             return False, "bootstrap module missing"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 내부 모듈 (RAG / 파이프라인 / 규칙 분석)
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
+# 내부 모듈
+# =========================
 try:
     from .pipeline_langchain import FarmLogPipeline, FarmLog
 except Exception as e:
@@ -51,9 +40,9 @@ try:
 except Exception as e:
     raise RuntimeError(f"cannot import extract.analyse: {e}")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 # 경로/상수
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 PROJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 REQ_PATH   = os.getenv("REQUIREMENTS_PATH", os.path.join(PROJ_ROOT, "requirements.txt"))
@@ -63,9 +52,10 @@ KB_DIR     = os.getenv("KB_DIR", os.path.join(PROJ_ROOT, "kb"))
 CHROMA_DIR = os.getenv("CHROMA_DIR", os.path.join(PROJ_ROOT, "chroma"))
 KEYWORDS_PATH = os.getenv("KEYWORDS_PATH", os.path.join(KB_DIR, "farming_keywords.txt"))
 
+# STT CSV 루트 (ID별 폴더/qa.csv)
 _raw_csv_dir = os.getenv("STT_CSV_DIR", os.path.join(PROJ_ROOT, "stt_csv"))
 STT_CSV_DIR = os.path.abspath(_raw_csv_dir if os.path.isabs(_raw_csv_dir) else os.path.join(PROJ_ROOT, _raw_csv_dir))
-STT_CSV_FILENAME = os.getenv("STT_CSV_FILENAME", "qa.csv")
+STT_CSV_FILENAME = os.getenv("STT_CSV_FILENAME", "qa.csv")  # 각 ID 폴더 내부 파일명
 
 REJECT_MSG = (
     "해당 내용은 분석결과 영농일지와 관련없는 내용으로 판단됩니다.\n"
@@ -80,11 +70,42 @@ _DEFAULT_FARM_KEYWORDS: Set[str] = {
     "알솎기","봉지씌우기","착색","보르도액","낙과","일소","열과","하우스관리","예찰","약제","살포"
 }
 
+# CSV 필드 표준 키(내부) ↔ 질문 라벨(외부)
+_FIELD_ALIASES: Dict[str, Set[str]] = {
+    "site": {"재배지","포장","위치","장소"},
+    "crop": {"작물","품목","품종"},
+    "operation": {"작업","카테고리","작업구분"},
+    "pesticide": {"농약","약제"},
+    "fertiliser": {"비료","시비","자재"},
+    "memo": {"메모","비고","기타"}
+}
+
+# 작업 카테고리 표준화(5종)
+_OP_CANON = {
+    "파종·정식": {"파종","정식","이식"},
+    "재배관리": {"재배관리","생육관리","하우스관리","관수","灌水","점적","양액","시비","추비","환기","차광","봉지","알솎기","착색"},
+    "병해충관리": {"병해","해충","방제","약제","살포","진딧물","탄저","역병","보르도"},
+    "수확": {"수확","예취","따기","거둬"},
+    "출하·유통": {"출하","유통","선별","포장","상차"}
+}
+
+def _canon_op(answer: str) -> Optional[str]:
+    a = (answer or "").replace(" ", "")
+    for key in _OP_CANON.keys():
+        if key.replace(" ","") == a:
+            return key
+    for key, kws in _OP_CANON.items():
+        for w in kws:
+            if w in (answer or ""):
+                return key
+    return answer.strip() if answer else None
+
+# 게이트 완화 옵션
 CSV_GATE_LENIENT = os.getenv("CSV_GATE_LENIENT", "1").lower() in ("1","true","yes")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 # FastAPI
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 app = FastAPI(title="FarmLog STT→RAG Baseline")
 app.add_middleware(
     CORSMiddleware,
@@ -92,9 +113,9 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 모델들
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
+# 기존 요약용 Pydantic models
+# =========================
 class SummariseRequest(BaseModel):
     stt_text: str
     date_hint: Optional[str] = None
@@ -129,7 +150,9 @@ class SummariseAutoRequest(BaseModel):
     stt_text: Optional[str] = None
     date_hint: Optional[str] = None
 
-# CSV 요약 결과(한글 키로 응답)
+# =========================
+# 새: CSV 요약 결과 모델 (한글 키로 응답)
+# =========================
 class CsvSummary(BaseModel):
     site: Optional[str]       = Field(default=None, alias="재배지")
     crop: Optional[str]       = Field(default=None, alias="작물")
@@ -138,21 +161,23 @@ class CsvSummary(BaseModel):
     fertiliser: Optional[str] = Field(default=None, alias="비료")
     memo: Optional[str]       = Field(default=None, alias="메모")
 
-    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    model_config = {
+        "populate_by_name": True  # Pydantic v2: 내부필드명으로 세팅 허용
+    }
 
-# CSV 요청(JSON)
+# 요청 모델(Union 대신 단일)
 class CsvJsonReq(BaseModel):
     id: Optional[str] = None
     path: Optional[str] = None
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 # 전역 상태
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 _pipeline: Optional[FarmLogPipeline] = None
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 # 유틸: text/ 파일
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 def _list_text_files() -> List[TextInfo]:
     os.makedirs(TEXT_DIR, exist_ok=True)
     files = sorted(glob.glob(os.path.join(TEXT_DIR, "*.txt")))
@@ -181,9 +206,9 @@ def _normalise_to_basename(path: str) -> str:
         raise HTTPException(status_code=400, detail="invalid path")
     return base
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 키워드 로딩
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
+# 키워드 로딩 (farming_keywords.txt)
+# =========================
 def _load_farm_keywords(path: str) -> Set[str]:
     kws: Set[str] = set()
     try:
@@ -210,9 +235,147 @@ def _load_farm_keywords(path: str) -> Set[str]:
         return set()
     return kws
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
+# CSV 도우미
+# =========================
+def _safe_id(id_text: str) -> str:
+    base = os.path.basename((id_text or "").strip())
+    if not base or any(ch in base for ch in ("..","/","\\")):
+        raise HTTPException(status_code=400, detail="invalid id")
+    return base
+
+def _id_to_csv_path(id_text: str) -> str:
+    safe = _safe_id(id_text)
+    return os.path.join(STT_CSV_DIR, safe, STT_CSV_FILENAME)
+
+def _canon_field(label: str) -> Optional[str]:
+    lab = (label or "").strip()
+    for k, al in _FIELD_ALIASES.items():
+        if lab in al:
+            return k
+    low = lab.lower()
+    if low in ("site","location","field","plot"): return "site"
+    if low in ("crop","item","variety"): return "crop"
+    if low in ("operation","category","work"): return "operation"
+    if low in ("pesticide","agrochemical","chem"): return "pesticide"
+    if low in ("fertiliser","fertilizer","nutrient"): return "fertiliser"
+    if low in ("memo","note","remarks"): return "memo"
+    return None
+
+def _read_qa_csv(csv_path: str) -> Dict[str, Optional[str]]:
+    """
+    CSV를 읽어 {표준필드: 값}으로 반환.
+    - UTF-8/UTF-8-SIG/CP949 자동 처리
+    - question,answer / field,value / 한글 라벨 헤더 / 헤더없음(라벨,값) 모두 처리
+    - 값 안의 쉼표도 허용(첫 쉼표만 라벨/값 경계로 보고 나머지는 값으로 재결합)
+    """
+    # 절대경로 정규화 & 상위 폴더 제한
+    csv_abs = os.path.abspath(csv_path if os.path.isabs(csv_path) else os.path.join(PROJ_ROOT, csv_path))
+    base_abs = os.path.abspath(STT_CSV_DIR)
+    try:
+        if os.path.commonpath([csv_abs, base_abs]) != base_abs:
+            raise HTTPException(status_code=400, detail="csv must be under STT_CSV_DIR")
+    except Exception:
+        raise HTTPException(status_code=400, detail="csv must be under STT_CSV_DIR")
+
+    if not os.path.exists(csv_abs):
+        raise HTTPException(status_code=404, detail=f"csv not found: {csv_abs}")
+
+    # --- 인코딩 로드(UTF-8-SIG → UTF-8 → CP949 순서) ---
+    text: str
+    try:
+        with open(csv_abs, "rb") as fb:
+            raw = fb.read()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = raw.decode("cp949")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"csv read error: {e}")
+
+    # 줄 정리
+    lines = [ln.strip() for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if ln.strip() != ""]
+    if not lines:
+        return {}
+
+    # 헤더 후보
+    header = [c.strip() for c in lines[0].split(",")]
+    header_l = [h.lower() for h in header]
+
+    out: Dict[str, Optional[str]] = {}
+
+    def _parse_rows_qna(rows: List[str], q_idx: int = 0, a_start_idx: int = 1) -> None:
+        for ln in rows:
+            cols = [c.strip() for c in ln.split(",")]
+            if len(cols) <= q_idx:
+                continue
+            label = cols[q_idx]
+            value = ",".join(cols[a_start_idx:]).strip() if len(cols) > a_start_idx else ""
+            fld = _canon_field(label)
+            if fld:
+                out[fld] = value if value != "" else None
+
+    # 1) question/answer, field/value 헤더
+    if set(header_l) >= {"question","answer"} or set(header_l) >= {"field","value"} \
+       or (header_l and header_l[0] in {"question","field","질문","항목","label","라벨"} and
+           len(header_l) > 1 and header_l[1] in {"answer","value","답변","값"}):
+        _parse_rows_qna(lines[1:], 0, 1)
+
+    # 2) 한글 라벨 헤더 + 2행 값
+    elif any(h in (_FIELD_ALIASES["site"] | _FIELD_ALIASES["crop"] | _FIELD_ALIASES["operation"] |
+                   _FIELD_ALIASES["pesticide"] | _FIELD_ALIASES["fertiliser"] | _FIELD_ALIASES["memo"]) for h in header):
+        if len(lines) >= 2:
+            vals = [c.strip() for c in lines[1].split(",")]
+            lab2idx = {h: i for i, h in enumerate(header)}
+            for k, aliases in _FIELD_ALIASES.items():
+                for al in aliases:
+                    if al in lab2idx:
+                        idx = lab2idx[al]
+                        if idx < len(vals):
+                            v = vals[idx]
+                            out[k] = v if v != "" else None
+
+    # 3) 헤더 없음: 각 행이 "라벨,값…" 구조
+    else:
+        for ln in lines:
+            if "," not in ln:
+                continue
+            label, value = ln.split(",", 1)
+            fld = _canon_field(label)
+            if fld:
+                v = value.strip()
+                out[fld] = v if v != "" else None
+
+    # 후처리: 작업 표준화, 빈문자열→None
+    if "operation" in out and out.get("operation"):
+        out["operation"] = _canon_op(out.get("operation") or "")
+    for k, v in list(out.items()):
+        if isinstance(v, str) and v.strip() == "":
+            out[k] = None
+
+    return out
+
+def _qa_to_text(qa: Dict[str, Optional[str]]) -> str:
+    pairs = []
+    label_map = {
+        "site": "재배지",
+        "crop": "작물",
+        "operation": "작업",
+        "pesticide": "농약",
+        "fertiliser": "비료",
+        "memo": "메모",
+    }
+    for k, v in qa.items():
+        if v:
+            pairs.append(f"{label_map.get(k,k)}: {v}")
+    return " / ".join(pairs)
+
+# =========================
 # 스타트업
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 @app.on_event("startup")
 def _startup():
     load_dotenv()
@@ -236,9 +399,9 @@ def _startup():
     except Exception:
         app.state.farm_keywords = set(_DEFAULT_FARM_KEYWORDS)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 # 헬스/리스트
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 @app.get("/healthz")
 def healthz():
     return {
@@ -256,9 +419,9 @@ def healthz():
 def list_texts():
     return _list_text_files()
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 # 기존: 자유 텍스트/파일 요약
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 def _run_with_analysis(
     stt_text: str,
     date_hint: Optional[str] = None,
@@ -267,9 +430,9 @@ def _run_with_analysis(
     search_queries: Optional[List[str]] = None,
 ):
     try:
-        is_semantic_ok, pos_sim, neg_sim = semantic_gate(stt_text, kb_dir=KB_DIR)
+        is_semantic_ok, _, _ = semantic_gate(stt_text, kb_dir=KB_DIR)
     except Exception:
-        is_semantic_ok, pos_sim, neg_sim = False, 0.0, 0.0
+        is_semantic_ok = False
 
     domain_kws: Set[str] = getattr(app.state, "farm_keywords", set()) or set(_DEFAULT_FARM_KEYWORDS)
     app.state.farm_keywords = domain_kws
@@ -395,70 +558,74 @@ def summarise_auto(req: SummariseAutoRequest):
         search_queries=None,
     )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CSV 기반 요약 (정확 6필드, 전처리/게이트 분리 적용)
-# ──────────────────────────────────────────────────────────────────────────────
-def _id_to_csv_path(id_text: str) -> str:
-    base = os.path.basename((id_text or "").strip())
-    if not base or any(ch in base for ch in ("..","/","\\")):
-        raise HTTPException(status_code=400, detail="invalid id")
-    return os.path.join(STT_CSV_DIR, base, STT_CSV_FILENAME)
+# =========================
+# 새: CSV 기반 요약 (정확 6필드)
+# =========================
+def _gate_csv_qa(qa: Dict[str, Optional[str]]) -> bool:
+    # 완화: 작물 또는 작업만 있으면 통과
+    if CSV_GATE_LENIENT and (qa.get("crop") or qa.get("operation")):
+        return True
 
-def _normalize_qa(qa: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
-    crop = normalize_crop(qa.get("crop"))
-    op   = normalize_operation(qa.get("operation"))
-    return {
-        "site":       normalize_site(qa.get("site")),
-        "crop":       crop,
-        "operation":  op,
-        "pesticide":  normalize_agri_input(qa.get("pesticide")),
-        "fertiliser": normalize_agri_input(qa.get("fertiliser")),
-        "memo":       summarize_memo(qa.get("memo"), crop=crop, op=op),
-    }
+    text = _qa_to_text(qa)
+    try:
+        is_semantic_ok, _, _ = semantic_gate(text, kb_dir=KB_DIR)
+    except Exception:
+        is_semantic_ok = False
+
+    domain_kws: Set[str] = getattr(app.state, "farm_keywords", set()) or set(_DEFAULT_FARM_KEYWORDS)
+    res = analyse(text, domain_kws, default_date=None)
+    domain_hits  = int(res.get("domain_hits") or 0)
+    op_hits      = int(res.get("op_hits") or 0)
+    nonfarm_hits = int(res.get("non_farm_hits") or 0)
+    agri_hits    = int(res.get("agri_hits") or 0)
+
+    if is_semantic_ok or agri_hits >= 1 or domain_hits >= 1 or op_hits >= 1:
+        return True
+    if nonfarm_hits >= 2 and agri_hits == 0:
+        return False
+    return False
 
 def _qa_to_summary(qa: Dict[str, Optional[str]]) -> CsvSummary:
-    n = _normalize_qa(qa)
     return CsvSummary(
-        site=n.get("site"),
-        crop=n.get("crop"),
-        operation=n.get("operation"),
-        pesticide=n.get("pesticide"),
-        fertiliser=n.get("fertiliser"),
-        memo=n.get("memo"),
+        site=qa.get("site"),
+        crop=qa.get("crop"),
+        operation=_canon_op(qa.get("operation") or ""),
+        pesticide=qa.get("pesticide"),
+        fertiliser=qa.get("fertiliser"),
+        memo=qa.get("memo"),
     )
 
 @app.post("/summarise_csv_id", response_model=CsvSummary, response_model_by_alias=True)
 def summarise_csv_id(id_text: str = Body(..., media_type="text/plain")):
     csv_path = _id_to_csv_path(id_text)
-    qa = read_qa_csv(csv_path, base_dir=STT_CSV_DIR)
-
-    domain_kws: Set[str] = getattr(app.state, "farm_keywords", set()) or set(_DEFAULT_FARM_KEYWORDS)
-    if not gate_csv_qa(qa, domain_kws=domain_kws, kb_dir=KB_DIR, csv_gate_lenient=CSV_GATE_LENIENT):
+    qa = _read_qa_csv(csv_path)
+    if not _gate_csv_qa(qa):
         return PlainTextResponse(REJECT_MSG)
-
     return _qa_to_summary(qa)
 
 @app.post("/summarise_csv_json", response_model=CsvSummary, response_model_by_alias=True)
 def summarise_csv_json(req: CsvJsonReq):
+    """
+    JSON 예:
+    { "id": "ID001" }
+    또는
+    { "path": "stt_csv/ID001/qa.csv" }
+    """
     if req.id:
         csv_path = _id_to_csv_path(req.id)
     elif req.path:
-        # 상대경로가 들어오면 프로젝트 루트 기준 절대화
-        csv_path = req.path if os.path.isabs(req.path) else os.path.abspath(os.path.join(PROJ_ROOT, req.path))
+        csv_path = req.path if os.path.isabs(req.path) else os.path.join(PROJ_ROOT, req.path)
     else:
         raise HTTPException(status_code=400, detail="must provide id or path")
 
-    qa = read_qa_csv(csv_path, base_dir=STT_CSV_DIR)
-
-    domain_kws: Set[str] = getattr(app.state, "farm_keywords", set()) or set(_DEFAULT_FARM_KEYWORDS)
-    if not gate_csv_qa(qa, domain_kws=domain_kws, kb_dir=KB_DIR, csv_gate_lenient=CSV_GATE_LENIENT):
+    qa = _read_qa_csv(csv_path)
+    if not _gate_csv_qa(qa):
         return PlainTextResponse(REJECT_MSG)
-
     return _qa_to_summary(qa)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 # KB 재인덱싱(+키워드 재로딩)
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 @app.post("/ingest")
 def ingest(req: IngestRequest):
     kb_dir = req.kb_dir or KB_DIR

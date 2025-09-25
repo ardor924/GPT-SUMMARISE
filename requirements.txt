@@ -1,15 +1,26 @@
-fastapi
-uvicorn[standard]
-python-dotenv
-pydantic>=2
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-dotenv>=1.0
+pydantic>=2.6
+typing_extensions>=4.10
+
+# LangChain
 langchain>=0.2.12
-langchain-openai
-langchain-community
-chromadb
-sentence-transformers
-duckduckgo-search
-tiktoken
-typing_extensions
-# DSPy (옵션)
-dspy-ai
-docarray
+langchain-openai>=0.1.17
+langchain-community>=0.2.10
+openai>=1.40  # ← 반드시 추가 (현재 코드에서 OpenAI SDK 직접 사용)
+
+# Vectorstores
+# Chroma는 윈도우에서 러스트 바인딩 이슈가 있을 수 있어 안전핀 두 가지 중 택1
+# (a) docarray만 쓸 거면 chromadb를 아예 빼기
+# (b) chromadb는 <0.5로 고정(러스트 미필요 빌드 라인 회피에 도움)
+docarray>=0.40
+# chromadb<0.5
+
+# 검색/토큰
+duckduckgo-search>=5.3
+tiktoken>=0.7
+
+# 선택: sentence-transformers (안 쓰시면 제거해도 됩니다. 설치가 무겁습니다)
+sentence-transformers>=2.7
+# CPU만 쓰면 torch는 pip가 자동으로 CPU 빌드 깔아줍니다. (CUDA 필요 시 별도 가이드)

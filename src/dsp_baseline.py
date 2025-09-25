@@ -1,3 +1,4 @@
+# src/dsp_baseline.py
 # -*- coding: utf-8 -*-
 """DSPy를 이용한 간단한 구조화 요약 파이프라인(웹 검색/벡터 검색은 외부에서 준비해 컨텍스트로 주입)"""
 from typing import Optional, List

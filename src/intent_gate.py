@@ -1,3 +1,4 @@
+# src/intent_gate.py
 # -*- coding: utf-8 -*-
 """
 임베딩 기반 의미적 게이트:

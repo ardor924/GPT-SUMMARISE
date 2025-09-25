@@ -1,3 +1,4 @@
+# src/pipeline_langchain.py
 # -*- coding: utf-8 -*-
 """
 FarmLog 파이프라인 (LangChain 기반)

@@ -1,3 +1,4 @@
+# src/rag.py
 # -*- coding: utf-8 -*-
 """
 로컬 KB 인덱싱 및 Retriever (Chroma → 실패 시 DocArrayInMemorySearch 폴백)

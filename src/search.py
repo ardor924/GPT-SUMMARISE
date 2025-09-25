@@ -1,3 +1,4 @@
+# src/search.py
 # -*- coding: utf-8 -*-
 """DuckDuckGo(무키) 또는 Google CSE(유료키) 웹 검색 래퍼"""
 from typing import List, Dict, Optional
